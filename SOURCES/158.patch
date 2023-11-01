@@ -1,0 +1,142 @@
+From e5b0e0948a422e5cc241efe0b55a1e841e2ca29c Mon Sep 17 00:00:00 2001
+From: Benjamin Berg <bberg@redhat.com>
+Date: Thu, 26 Aug 2021 14:26:40 +0200
+Subject: [PATCH 1/3] tests: Set G_MESSAGES_DEBUG=all for daemon as it is
+ needed
+
+Otherwise executing the test script outside of the meson environment
+will fail as the inhibitor test relies on being able to parse the log.
+---
+ tests/fprintd.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tests/fprintd.py b/tests/fprintd.py
+index 8fa615f..801ee81 100644
+--- a/tests/fprintd.py
++++ b/tests/fprintd.py
+@@ -237,6 +237,8 @@ class FPrintdTest(dbusmock.DBusTestCase):
+         env['G_DEBUG'] = 'fatal-criticals'
+         env['STATE_DIRECTORY'] = (self.state_dir + ':' + '/hopefully/a/state_dir_path/that/shouldnt/be/writable')
+         env['RUNTIME_DIRECTORY'] = self.run_dir
++        # The tests parses the debug output for suspend inhibitor debugging
++        env['G_MESSAGES_DEBUG'] = 'all'
+ 
+         argv = [self.paths['daemon'], '-t']
+         valgrind = os.getenv('VALGRIND')
+-- 
+GitLab
+
+
+From 8ca81d5166b47300e99ba5637f4b3c7fa9a00cd4 Mon Sep 17 00:00:00 2001
+From: Benjamin Berg <bberg@redhat.com>
+Date: Thu, 26 Aug 2021 14:23:15 +0200
+Subject: [PATCH 2/3] tests: Use dbusmock start_system_bus instead of GLib
+ server
+
+---
+ tests/fprintd.py | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/tests/fprintd.py b/tests/fprintd.py
+index 801ee81..6754a56 100644
+--- a/tests/fprintd.py
++++ b/tests/fprintd.py
+@@ -211,14 +211,8 @@ class FPrintdTest(dbusmock.DBusTestCase):
+             n = os.path.basename(f)[:-4]
+             cls.prints[n] = load_image(f)
+ 
+-
+-        cls.test_bus = Gio.TestDBus.new(Gio.TestDBusFlags.NONE)
+-        cls.test_bus.up()
+-        cls.addClassCleanup(cls.test_bus.down)
+-        cls.test_bus.unset()
+-        addr = cls.test_bus.get_bus_address()
+-        os.environ['DBUS_SYSTEM_BUS_ADDRESS'] = addr
+-        cls.dbus = Gio.DBusConnection.new_for_address_sync(addr,
++        cls.start_system_bus()
++        cls.dbus = Gio.DBusConnection.new_for_address_sync(os.environ['DBUS_SYSTEM_BUS_ADDRESS'],
+             Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION |
+             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT, None, None)
+         assert cls.dbus.is_closed() == False
+@@ -229,7 +223,6 @@ class FPrintdTest(dbusmock.DBusTestCase):
+         dbusmock.DBusTestCase.tearDownClass()
+ 
+         del cls.dbus
+-        del cls.test_bus
+ 
+     def daemon_start(self, driver='Virtual image device for debugging'):
+         timeout = get_timeout('daemon_start')  # seconds
+-- 
+GitLab
+
+
+From 84ad711d48952e129abfad3bd2f509d30af65eb6 Mon Sep 17 00:00:00 2001
+From: Benjamin Berg <bberg@redhat.com>
+Date: Thu, 26 Aug 2021 14:25:12 +0200
+Subject: [PATCH 3/3] tests: Better cleanup helper processes and objects
+
+We were leaking the bus connections for the proxy objects. Also, now the
+subprocesses will be forcefully killed at shutdown.
+---
+ tests/fprintd.py | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/tests/fprintd.py b/tests/fprintd.py
+index 6754a56..f828b27 100644
+--- a/tests/fprintd.py
++++ b/tests/fprintd.py
+@@ -243,6 +243,7 @@ class FPrintdTest(dbusmock.DBusTestCase):
+             self.valgrind = True
+         self.kill_daemon = False
+         self.daemon_log = OutputChecker()
++        self.addCleanup(self.daemon_log.force_close)
+         self.daemon = subprocess.Popen(argv,
+                                        env=env,
+                                        stdout=self.daemon_log.fd,
+@@ -330,14 +331,23 @@ class FPrintdTest(dbusmock.DBusTestCase):
+ 
+         self._polkitd, self._polkitd_obj = self.spawn_server_template(
+             polkitd_template, {}, stdout=subprocess.PIPE)
++        self.addCleanup(self.stop_server, '_polkitd', '_polkitd_obj')
+ 
+         return self._polkitd
+ 
+-    def polkitd_stop(self):
+-        if self._polkitd is None:
++    def stop_server(self, proc_attr, obj_attr):
++        proc = getattr(self, proc_attr, None)
++        if proc is None:
+             return
+-        self._polkitd.terminate()
+-        self._polkitd.wait()
++
++        proc.terminate()
++        try:
++            proc.wait(timeout=1)
++        except subprocess.TimeoutExpired as e:
++            proc.kill()
++
++        delattr(self, proc_attr)
++        delattr(self, obj_attr)
+ 
+     def polkitd_allow_all(self):
+         self._polkitd_obj.SetAllowed([FprintDevicePermission.set_username,
+@@ -593,7 +603,6 @@ class FPrintdVirtualDeviceBaseTest(FPrintdVirtualImageDeviceBaseTests):
+         self.manager = None
+         self.device = None
+         self.polkitd_start()
+-        self.addCleanup(self.polkitd_stop)
+ 
+         fifo_path = os.path.join(self.tmpdir, 'logind_inhibit_fifo')
+         os.mkfifo(fifo_path)
+@@ -608,6 +617,7 @@ class FPrintdVirtualDeviceBaseTest(FPrintdVirtualImageDeviceBaseTests):
+                                   'ret = os.open("%s", os.O_WRONLY)\n' % fifo_path +
+                                   'from gi.repository import GLib\n' +
+                                   'GLib.idle_add(lambda fd: os.close(fd), ret)')
++        self.addCleanup(self.stop_server, 'logind', 'logind_obj')
+         self.daemon_start(self.driver_name)
+ 
+         self.wait_got_delay_inhibitor(timeout=5)
+-- 
+GitLab
+
